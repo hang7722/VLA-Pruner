@@ -215,6 +215,32 @@ def eval_libero(cfg: GenerateConfig) -> None:
                         processor=processor,
                         last_caches=last_caches,
                     )
+                    telemetry = getattr(model, "last_inference_stats", None)
+                    if isinstance(telemetry, dict):
+                        pruning_info = telemetry.get("pruning_info")
+                        step_metrics = {
+                            "prefill_latency_ms": telemetry.get("prefill_latency_ms", 0.0),
+                            "decode_latency_ms": telemetry.get("decode_latency_ms", 0.0),
+                            "total_latency_ms": telemetry.get("total_latency_ms", 0.0),
+                            "prefill_decode_split": telemetry.get("prefill_decode_split", "approximate_by_generate_calls"),
+                            "use_temporal": telemetry.get("use_temporal", cfg.use_temporal),
+                            "temporal_history_ready": telemetry.get("temporal_history_ready", False),
+                            "temporal_history_len": telemetry.get("temporal_history_len", 0),
+                            "selection_mode": telemetry.get("selection_mode", None),
+                            "redundancy_filter_applied": telemetry.get("redundancy_filter_applied", None),
+                            "pruning_triggered": pruning_info.get("pruning_triggered") if isinstance(pruning_info, dict) else False,
+                            "pruning_layer": pruning_info.get("pruning_layer") if isinstance(pruning_info, dict) else None,
+                            "original_seq_length": pruning_info.get("original_seq_length") if isinstance(pruning_info, dict) else None,
+                            "kept_seq_length": pruning_info.get("kept_seq_length") if isinstance(pruning_info, dict) else None,
+                            "original_image_token_length": pruning_info.get("original_image_token_length") if isinstance(pruning_info, dict) else None,
+                            "kept_image_token_length": pruning_info.get("kept_image_token_length") if isinstance(pruning_info, dict) else None,
+                            "effective_keep_ratio": pruning_info.get("effective_keep_ratio") if isinstance(pruning_info, dict) else None,
+                            "num_keep": pruning_info.get("num_keep") if isinstance(pruning_info, dict) else None,
+                            "kept_indices_count": pruning_info.get("kept_indices_count") if isinstance(pruning_info, dict) else None,
+                            "pruned_indices_count": pruning_info.get("pruned_indices_count") if isinstance(pruning_info, dict) else None,
+                        }
+                        print(f"[Telemetry][step={t}] {step_metrics}")
+                        log_file.write(f"[Telemetry][step={t}] {step_metrics}\n")
                     replay_images_heatmap.append(result_image)
                     # Normalize gripper action [0,1] -> [-1,+1] because the environment expects the latter
                     action = normalize_gripper_action(action, binarize=True)

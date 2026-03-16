@@ -13,6 +13,7 @@ References [LLaVa, IDEFICS-2]:
 """
 
 import logging
+import time
 from dataclasses import dataclass
 from functools import partial
 from typing import Any, Callable, ClassVar, Dict, List, Optional, Tuple, Union
@@ -563,6 +564,14 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             input_ids = torch.cat(
                 (input_ids, torch.unsqueeze(torch.Tensor([29871]).long(), dim=0).to(input_ids.device)), dim=1
             )
+        total_t0 = None
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        total_t0 = time.perf_counter()
+
+        temporal_history_ready = False
+        temporal_history_len = len(self.av_hist)
+
         if self.use_fastv or self.sparsevlm:
             historical_attention = None
             if self.use_temporal and len(self.av_hist) == self.av_hist.maxlen:
@@ -576,6 +585,9 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
                     guided += weights[i] * self.av_hist[-1 - i]
                 guided = guided / np.sum(guided)
                 historical_attention = torch.tensor(guided, device=input_ids.device, dtype=torch.bfloat16)
+                temporal_history_ready = True
+            else:
+                temporal_history_ready = False
             
             if historical_attention is not None or not self.use_temporal:
                 self.fastv_config = {
@@ -634,6 +646,26 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             0.5 * (normalized_actions + 1) * (action_high - action_low) + action_low,
             normalized_actions,
         )
+
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        total_latency_ms = (time.perf_counter() - total_t0) * 1000.0
+
+        lm_stats = getattr(self.language_model, "last_inference_stats", {}) or {}
+        pruning_info = getattr(self.language_model, "pruning_info", None)
+        self.last_inference_stats = {
+            "prefill_latency_ms": float(lm_stats.get("prefill_latency_ms", 0.0)),
+            "decode_latency_ms": float(lm_stats.get("decode_latency_ms", 0.0)),
+            "total_latency_ms": float(total_latency_ms),
+            "prefill_decode_split": lm_stats.get("prefill_decode_split", "approximate_by_generate_calls"),
+            "use_temporal": bool(self.use_temporal),
+            "temporal_history_ready": bool(temporal_history_ready),
+            "temporal_history_len": int(temporal_history_len),
+            "selection_mode": pruning_info.get("selection_mode") if isinstance(pruning_info, dict) else None,
+            "redundancy_filter_applied": pruning_info.get("redundancy_filter_applied") if isinstance(pruning_info, dict) else None,
+            "pruning_info": pruning_info,
+        }
+
         return actions, last_caches
 
 
@@ -721,4 +753,3 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         """Get all the logged statistics for the given dataset."""
         unnorm_key = self._check_unnorm_key(self.norm_stats, unnorm_key)
         return self.norm_stats[unnorm_key]["action"]
-
