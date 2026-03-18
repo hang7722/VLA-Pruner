@@ -10,6 +10,7 @@ import argparse
 import json
 import math
 import sys
+import textwrap
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -47,11 +48,10 @@ from experiments.robot.robot_utils import (
 
 
 DEFAULT_STEPS = [10, 12, 13, 15]
-TOP_RATIOS = (0.125, 0.25, 0.5)
-TOP_COLORS = (
-    (128, 0, 255, 140),
-    (255, 140, 0, 110),
-    (255, 220, 0, 80),
+TOP_LEVELS = (
+    ("top 40%", 0.40, (46, 196, 182, 72)),
+    ("top 20%", 0.20, (59, 130, 246, 112)),
+    ("top 10%", 0.10, (220, 38, 38, 156)),
 )
 
 
@@ -189,20 +189,20 @@ def make_continuous_overlay(rgb: np.ndarray, values: np.ndarray | None) -> Image
     return Image.alpha_composite(rgb_img, Image.fromarray(overlay, mode="RGBA")).convert("RGB")
 
 
-def make_patch_overlay(rgb: np.ndarray, values: np.ndarray | None) -> Image.Image | None:
+def make_patch_overlay(rgb: np.ndarray, values: np.ndarray | None) -> tuple[Image.Image | None, str | None]:
     norm = normalize_map(values)
     if norm is None:
-        return None
+        return None, "unavailable"
     side = infer_grid_size(norm.size)
     if side is None:
-        return None
+        return None, "non-square token grid"
     image = Image.fromarray(rgb.astype(np.uint8)).convert("RGBA")
     overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
     patch_h = image.size[1] / side
     patch_w = image.size[0] / side
     order = np.argsort(norm)[::-1]
-    for top_ratio, color in zip(TOP_RATIOS, TOP_COLORS):
+    for _, top_ratio, color in TOP_LEVELS:
         top_k = max(1, int(round(norm.size * top_ratio)))
         indices = order[:top_k]
         for idx in indices:
@@ -212,16 +212,16 @@ def make_patch_overlay(rgb: np.ndarray, values: np.ndarray | None) -> Image.Imag
             x1 = int(round((col + 1) * patch_w))
             y1 = int(round((row + 1) * patch_h))
             draw.rectangle([x0, y0, x1, y1], fill=color, outline=(255, 255, 255, 40))
-    return Image.alpha_composite(image, overlay).convert("RGB")
+    return Image.alpha_composite(image, overlay).convert("RGB"), None
 
 
-def make_binary_mask(rgb: np.ndarray, mask_values: np.ndarray | None, color: tuple[int, int, int, int]) -> Image.Image | None:
+def make_binary_mask(rgb: np.ndarray, mask_values: np.ndarray | None, color: tuple[int, int, int, int]) -> tuple[Image.Image | None, str | None]:
     if mask_values is None:
-        return None
+        return None, "unavailable"
     mask_values = np.asarray(mask_values, dtype=np.float32)
     side = infer_grid_size(mask_values.size)
     if side is None:
-        return None
+        return None, "non-square token grid"
     image = Image.fromarray(rgb.astype(np.uint8)).convert("RGBA")
     overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
@@ -236,7 +236,7 @@ def make_binary_mask(rgb: np.ndarray, mask_values: np.ndarray | None, color: tup
         x1 = int(round((col + 1) * patch_w))
         y1 = int(round((row + 1) * patch_h))
         draw.rectangle([x0, y0, x1, y1], fill=color, outline=(255, 255, 255, 70))
-    return Image.alpha_composite(image, overlay).convert("RGB")
+    return Image.alpha_composite(image, overlay).convert("RGB"), None
 
 
 def build_keep_prune_masks(pruning_info: dict | None) -> tuple[np.ndarray | None, np.ndarray | None]:
@@ -260,22 +260,99 @@ def build_keep_prune_masks(pruning_info: dict | None) -> tuple[np.ndarray | None
     return keep_mask, prune_mask
 
 
-def save_panel(output_path: Path, title: str, images: list[tuple[str, Image.Image | None]]) -> None:
-    tile_w, tile_h = 256, 256
-    cols = 3
-    rows = int(math.ceil(len(images) / cols))
-    panel = Image.new("RGB", (cols * tile_w, rows * (tile_h + 24)), (255, 255, 255))
+def draw_centered_multiline(draw: ImageDraw.ImageDraw, box: tuple[int, int, int, int], text: str, fill=(0, 0, 0)) -> None:
+    lines = text.split("\n")
+    line_height = 16
+    total_h = len(lines) * line_height
+    y = box[1] + max(0, (box[3] - box[1] - total_h) // 2)
+    for line in lines:
+        bbox = draw.textbbox((0, 0), line)
+        text_w = bbox[2] - bbox[0]
+        x = box[0] + max(0, (box[2] - box[0] - text_w) // 2)
+        draw.text((x, y), line, fill=fill)
+        y += line_height
+
+
+def wrap_text_block(lines: list[str], width: int) -> str:
+    wrapped = []
+    for line in lines:
+        wrapped.extend(textwrap.wrap(line, width=width) or [""])
+    return "\n".join(wrapped)
+
+
+def make_panel_tile(label: str, image: Image.Image | None, unavailable_reason: str | None, tile_w: int, tile_h: int) -> Image.Image:
+    card = Image.new("RGB", (tile_w, tile_h), (252, 252, 252))
+    draw = ImageDraw.Draw(card)
+    draw.rounded_rectangle([0, 0, tile_w - 1, tile_h - 1], radius=14, outline=(210, 210, 215), width=2, fill=(252, 252, 252))
+    draw.rounded_rectangle([10, 10, tile_w - 10, 36], radius=10, fill=(240, 243, 248))
+    draw.text((18, 17), label, fill=(20, 20, 20))
+    content_box = (12, 48, tile_w - 12, tile_h - 12)
+    if image is not None:
+        content = image.resize((content_box[2] - content_box[0], content_box[3] - content_box[1]))
+        card.paste(content, (content_box[0], content_box[1]))
+    else:
+        draw.rounded_rectangle(content_box, radius=10, fill=(236, 238, 243))
+        draw_centered_multiline(draw, content_box, unavailable_reason or "unavailable", fill=(90, 96, 110))
+    return card
+
+
+def make_legend_tile(tile_w: int, tile_h: int) -> Image.Image:
+    card = Image.new("RGB", (tile_w, tile_h), (252, 252, 252))
+    draw = ImageDraw.Draw(card)
+    draw.rounded_rectangle([0, 0, tile_w - 1, tile_h - 1], radius=14, outline=(210, 210, 215), width=2, fill=(252, 252, 252))
+    draw.rounded_rectangle([10, 10, tile_w - 10, 36], radius=10, fill=(240, 243, 248))
+    draw.text((18, 17), "Legend", fill=(20, 20, 20))
+    y = 64
+    for label, _, color in reversed(TOP_LEVELS):
+        draw.rounded_rectangle([24, y, 64, y + 24], radius=6, fill=color)
+        draw.text((80, y + 4), label, fill=(35, 35, 35))
+        y += 40
+    draw.text((24, y + 10), "Patch overlay = nested top-k blocks", fill=(70, 75, 85))
+    return card
+
+
+def save_panel(
+    output_path: Path,
+    title_lines: list[str],
+    metadata_lines: list[str],
+    tiles: list[tuple[str, Image.Image | None, str | None]],
+) -> None:
+    tile_w, tile_h = 300, 300
+    cols = 4
+    rows = 2
+    pad = 18
+    header_h = 88
+    footer_h = 88
+    panel_w = cols * tile_w + (cols + 1) * pad
+    panel_h = header_h + rows * tile_h + (rows + 1) * pad + footer_h
+    panel = Image.new("RGB", (panel_w, panel_h), (245, 247, 250))
     draw = ImageDraw.Draw(panel)
-    draw.text((10, 4), title, fill=(0, 0, 0))
-    for idx, (label, image) in enumerate(images):
+
+    draw.rounded_rectangle([pad, pad, panel_w - pad, header_h], radius=18, fill=(255, 255, 255), outline=(220, 224, 230))
+    header_text = wrap_text_block(title_lines, width=62)
+    draw_centered_multiline(draw, (pad + 12, pad + 8, panel_w - pad - 12, header_h - 8), header_text, fill=(18, 18, 18))
+
+    extended_tiles = tiles + [("Legend", make_legend_tile(tile_w, tile_h), None)]
+    while len(extended_tiles) < cols * rows:
+        extended_tiles.append(("Reserved", None, "reserved"))
+
+    start_y = header_h + pad
+    for idx, (label, image, unavailable_reason) in enumerate(extended_tiles[: cols * rows]):
         row = idx // cols
         col = idx % cols
-        x = col * tile_w
-        y = row * (tile_h + 24) + 24
-        tile = image if image is not None else Image.new("RGB", (tile_w, tile_h), (235, 235, 235))
-        tile = tile.resize((tile_w, tile_h))
+        x = pad + col * (tile_w + pad)
+        y = start_y + row * (tile_h + pad)
+        tile = image if label == "Legend" and image is not None else make_panel_tile(label, image, unavailable_reason, tile_w, tile_h)
         panel.paste(tile, (x, y))
-        draw.text((x + 8, y - 18), label, fill=(0, 0, 0))
+
+    footer_y0 = panel_h - footer_h - pad
+    draw.rounded_rectangle([pad, footer_y0, panel_w - pad, panel_h - pad], radius=18, fill=(255, 255, 255), outline=(220, 224, 230))
+    midpoint = int(math.ceil(len(metadata_lines) / 2))
+    footer_text = wrap_text_block(
+        [" | ".join(metadata_lines[:midpoint]), " | ".join(metadata_lines[midpoint:])],
+        width=88,
+    )
+    draw_centered_multiline(draw, (pad + 12, footer_y0 + 8, panel_w - pad - 12, panel_h - pad - 8), footer_text, fill=(45, 50, 60))
     panel.save(output_path)
 
 
@@ -303,6 +380,8 @@ def capture_step_artifacts(
     telemetry = getattr(model, "last_inference_stats", {}) or {}
     pruning_info = telemetry.get("pruning_info") or {}
     vis_cache = getattr(model, "last_visualization_cache", {}) or {}
+    summary = telemetry.get("summary") or {}
+    dynamic = telemetry.get("dynamic") or {}
 
     decode_map = tensor_to_vector(vis_cache.get("action_vision_attentions"), reduce_dims=(1, 2))
     prefill_map = tensor_to_vector(vis_cache.get("prefill_attentions"), reduce_dims=(1, 2))
@@ -325,26 +404,34 @@ def capture_step_artifacts(
         prefill_map = prefill_map[min(15, prefill_map.shape[0] - 1)]
 
     keep_mask, prune_mask = build_keep_prune_masks(pruning_info)
+    temporal_reason = None
+    if not summary.get("use_temporal"):
+        temporal_reason = "temporal disabled"
+    elif not dynamic.get("temporal_history_ready"):
+        temporal_reason = "history not ready"
+    elif temporal_guide is None:
+        temporal_reason = "cache missing"
 
-    pref_overlay = make_patch_overlay(rgb, prefill_map)
-    decode_overlay = make_patch_overlay(rgb, decode_map)
-    temporal_overlay = make_patch_overlay(rgb, temporal_guide)
-    current_score_overlay = make_patch_overlay(rgb, current_score)
-    keep_mask_overlay = make_binary_mask(rgb, keep_mask, (255, 210, 0, 120))
-    prune_mask_overlay = make_binary_mask(rgb, prune_mask, (160, 160, 160, 120))
+    pref_overlay, pref_reason = make_patch_overlay(rgb, prefill_map)
+    decode_overlay, decode_reason = make_patch_overlay(rgb, decode_map)
+    temporal_overlay, temporal_overlay_reason = make_patch_overlay(rgb, temporal_guide)
+    current_score_overlay, current_score_reason = make_patch_overlay(rgb, current_score)
+    keep_mask_overlay, keep_reason = make_binary_mask(rgb, keep_mask, (34, 197, 94, 120))
+    prune_mask_overlay, prune_reason = make_binary_mask(rgb, prune_mask, (107, 114, 128, 125))
 
-    unavailable = []
-    artifact_map = {
-        "prefill_overlay": pref_overlay,
-        "decode_overlay": decode_overlay,
-        "temporal_guide_overlay": temporal_overlay,
-        "current_score_overlay": current_score_overlay,
-        "keep_mask": keep_mask_overlay,
-        "prune_mask": prune_mask_overlay,
+    if temporal_reason is not None:
+        temporal_overlay = None
+        temporal_overlay_reason = temporal_reason
+
+    unavailable_reasons = {
+        "prefill_overlay": pref_reason,
+        "decode_overlay": decode_reason,
+        "temporal_guide_overlay": temporal_overlay_reason,
+        "current_score_overlay": current_score_reason,
+        "keep_mask": keep_reason,
+        "prune_mask": prune_reason,
     }
-    for name, image in artifact_map.items():
-        if image is None:
-            unavailable.append(name)
+    unavailable = [name for name, reason in unavailable_reasons.items() if reason is not None]
 
     rgb_image = Image.fromarray(rgb.astype(np.uint8))
     rgb_image.save(output_dir / f"step_{step:02d}_rgb.png")
@@ -362,15 +449,28 @@ def capture_step_artifacts(
         prune_mask_overlay.save(output_dir / f"step_{step:02d}_prune_mask.png")
 
     save_panel(
-        output_dir / f"step_{step:02d}_panel.png",
-        title=f"{task_name} | episode={episode_idx} | step={step} | mode={mode}",
-        images=[
-            ("rgb", rgb_image),
-            ("prefill", pref_overlay),
-            ("decode", decode_overlay),
-            ("temporal_guide", temporal_overlay),
-            ("current_score", current_score_overlay),
-            ("keep_mask", keep_mask_overlay),
+        output_path=output_dir / f"step_{step:02d}_panel.png",
+        title_lines=[
+            task_name,
+            f"episode={episode_idx}   step={step}   mode={mode}",
+        ],
+        metadata_lines=[
+            f"selection_mode={summary.get('selection_mode')}",
+            f"use_temporal={summary.get('use_temporal')}",
+            f"temporal_history_ready={dynamic.get('temporal_history_ready')}",
+            f"temporal_history_len={dynamic.get('temporal_history_len')}",
+            f"kept_seq_length={dynamic.get('kept_seq_length')}",
+            f"kept_image_token_length={dynamic.get('kept_image_token_length')}",
+            f"core_inference_latency_ms={telemetry.get('core_inference_latency_ms')}",
+        ],
+        tiles=[
+            ("RGB", rgb_image, None),
+            ("Prefill", pref_overlay, pref_reason),
+            ("Decode", decode_overlay, decode_reason),
+            ("Temporal Guide", temporal_overlay, temporal_overlay_reason),
+            ("Current Score", current_score_overlay, current_score_reason),
+            ("Keep Mask", keep_mask_overlay, keep_reason),
+            ("Prune Mask", prune_mask_overlay, prune_reason),
         ],
     )
 
@@ -380,7 +480,6 @@ def capture_step_artifacts(
     if original_image_token_length not in (None, 0) and kept_image_token_length is not None:
         effective_keep_ratio = float(kept_image_token_length) / float(original_image_token_length)
 
-    dynamic = telemetry.get("dynamic") or {}
     meta = {
         "task_name": task_name,
         "episode_idx": episode_idx,
@@ -397,7 +496,10 @@ def capture_step_artifacts(
         "kept_image_token_length": kept_image_token_length,
         "effective_keep_ratio": effective_keep_ratio,
         "core_inference_latency_ms": telemetry.get("core_inference_latency_ms"),
+        "temporal_guide_available": temporal_overlay_reason is None,
+        "temporal_guide_unavailable_reason": temporal_overlay_reason,
         "unavailable_visualizations": unavailable,
+        "unavailable_reasons": unavailable_reasons,
     }
     write_json(output_dir / f"step_{step:02d}_meta.json", meta)
 
