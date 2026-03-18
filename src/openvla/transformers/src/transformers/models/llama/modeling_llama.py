@@ -20,7 +20,6 @@
 """PyTorch LLaMA model."""
 
 import math
-import time
 import warnings
 from typing import List, Optional, Tuple, Union
 
@@ -985,10 +984,6 @@ class LlamaModel(LlamaPreTrainedModel):
         cache_position: Optional[torch.LongTensor] = None,
         fastv_config = None,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-        _fastv_t0 = time.perf_counter()
-
         FASTV_k = fastv_config['fastv_k']
         FASTV_r = fastv_config['fastv_r']
         FASTV_image_token_start_index = fastv_config['image_token_start_index']
@@ -998,6 +993,8 @@ class LlamaModel(LlamaPreTrainedModel):
         use_text_vision_selection = fastv_config['use_text_vision_selection']
         use_prefil_attention = fastv_config['use_prefil_attention']
         SparseVLM = fastv_config['SparseVLM']
+        temporal_w = fastv_config.get('temporal_w')
+        temporal_gamma = fastv_config.get('temporal_gamma')
         
         if SparseVLM:
             use_text_vision_selection = True
@@ -1071,17 +1068,14 @@ class LlamaModel(LlamaPreTrainedModel):
         pruning_info['rater_ids'] = rater_ids
         pruning_info['pruning_triggered'] = False
         pruning_info['selection_mode'] = 'fastv_last_token'
-        pruning_info['redundancy_filter_applied'] = False
+        pruning_info['redundancy_filter_enabled'] = bool(use_temporal)
         pruning_info['original_image_token_length'] = FASTV_image_token_length
         pruning_info['kept_image_token_length'] = FASTV_image_token_length
         pruning_info['num_keep'] = FASTV_image_token_length
-        pruning_info['effective_keep_ratio'] = 1.0
-        pruning_info['kept_indices_count'] = None
-        pruning_info['pruned_indices_count'] = 0
+        pruning_info['target_keep_ratio'] = 1.0
         pruning_info['kept_seq_length'] = seq_length_with_past
-        pruning_info['use_temporal'] = use_temporal
-        pruning_info['temporal_history_ready'] = Temporal_Guide is not None
-        pruning_info['temporal_history_len'] = int(Temporal_Guide.shape[-1]) if Temporal_Guide is not None else 0
+        pruning_info['temporal_w'] = temporal_w
+        pruning_info['temporal_gamma'] = temporal_gamma
 
         for layer_idx, decoder_layer in enumerate(self.layers):
             if output_hidden_states:
@@ -1136,7 +1130,6 @@ class LlamaModel(LlamaPreTrainedModel):
                                 selected_features = visual_features[unique_indices]
                                 final_indices = self._redundancy_minization(selected_features, num_keep)
                                 final_topk = unique_indices[final_indices]
-                                pruning_info['redundancy_filter_applied'] = True
                             else:
                                 final_topk = unique_indices
                             pruning_info['selection_mode'] = 'temporal_guided'
@@ -1160,16 +1153,13 @@ class LlamaModel(LlamaPreTrainedModel):
                         pruning_info['pruning_layer'] = layer_idx
                         pruning_info['pruning_triggered'] = True
                         pruning_info['num_keep'] = int(num_keep)
-                        pruning_info['kept_indices_count'] = int(keep_indexs.numel())
-                        pruning_info['pruned_indices_count'] = int(pruning_info['pruned_indices'].numel())
+                        pruning_info['target_keep_ratio'] = (
+                            float(num_keep) / float(FASTV_image_token_length) if FASTV_image_token_length > 0 else 1.0
+                        )
                         pruning_info['kept_seq_length'] = int(new_seq_length)
                         pruning_info['kept_image_token_length'] = int((keep_indexs >= FASTV_image_token_start_index).logical_and(
                             keep_indexs < (FASTV_image_token_start_index + FASTV_image_token_length)
                         ).sum().item())
-                        pruning_info['effective_keep_ratio'] = (
-                            float(pruning_info['kept_image_token_length']) / float(FASTV_image_token_length)
-                            if FASTV_image_token_length > 0 else 1.0
-                        )
                         hidden_states = hidden_states[:,keep_indexs,:] 
                        
                         # update position ids
@@ -1209,16 +1199,13 @@ class LlamaModel(LlamaPreTrainedModel):
                     pruning_info['pruning_layer'] = layer_idx
                     pruning_info['pruning_triggered'] = True
                     pruning_info['num_keep'] = int(num_keep)
-                    pruning_info['kept_indices_count'] = int(keep_indexs.numel())
-                    pruning_info['pruned_indices_count'] = int(pruning_info['pruned_indices'].numel())
+                    pruning_info['target_keep_ratio'] = (
+                        float(num_keep) / float(FASTV_image_token_length) if FASTV_image_token_length > 0 else 1.0
+                    )
                     pruning_info['kept_seq_length'] = int(new_seq_length)
                     pruning_info['kept_image_token_length'] = int((keep_indexs >= FASTV_image_token_start_index).logical_and(
                         keep_indexs < (FASTV_image_token_start_index + FASTV_image_token_length)
                     ).sum().item())
-                    pruning_info['effective_keep_ratio'] = (
-                        float(pruning_info['kept_image_token_length']) / float(FASTV_image_token_length)
-                        if FASTV_image_token_length > 0 else 1.0
-                    )
                     # filter hidden states
                     hidden_states = hidden_states[:,keep_indexs,:] # lead the cuda error in the second iteration of decoding layeridx 3
                     # update position ids
@@ -1262,10 +1249,6 @@ class LlamaModel(LlamaPreTrainedModel):
                 next_decoder_cache.to_legacy_cache() if isinstance(next_decoder_cache, Cache) else next_decoder_cache
             )
         
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-        _fastv_total_ms = (time.perf_counter() - _fastv_t0) * 1000.0
-        pruning_info['fastv_forward_latency_ms'] = float(_fastv_total_ms)
         self.last_pruning_stats = pruning_info
 
         if not return_dict:
@@ -1528,24 +1511,11 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         >>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
         "Hey, are you conscious? Can you talk to me?\nI'm not conscious, but I can talk to you."
         ```"""
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-        _call_t0 = time.perf_counter()
-
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
-        # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
-        current_seq_len = int(inputs_embeds.shape[1]) if inputs_embeds is not None else int(input_ids.shape[1])
-        is_prefill_call = current_seq_len > 1
-        if is_prefill_call or not hasattr(self, "_inference_timing_acc"):
-            self._inference_timing_acc = {
-                "prefill_latency_ms": 0.0,
-                "decode_latency_ms": 0.0,
-            }
 
         outputs = self.model.fastv_forward(
             input_ids=input_ids,
@@ -1587,14 +1557,6 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
             output = (logits,) + outputs[1:]
             return (loss,) + output if loss is not None else output
 
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-        _call_ms = (time.perf_counter() - _call_t0) * 1000.0
-        if is_prefill_call:
-            self._inference_timing_acc["prefill_latency_ms"] += float(_call_ms)
-        else:
-            self._inference_timing_acc["decode_latency_ms"] += float(_call_ms)
-
         # Create output and add pruning info
         causal_output = CausalLMOutputWithPast(
             loss=loss,
@@ -1611,14 +1573,6 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         # Sync pruning info from decoder for upper layer access
         if hasattr(self.model, 'pruning_info'):
             self.pruning_info = self.model.pruning_info
-
-        self.last_inference_stats = {
-            "prefill_latency_ms": float(self._inference_timing_acc.get("prefill_latency_ms", 0.0)),
-            "decode_latency_ms": float(self._inference_timing_acc.get("decode_latency_ms", 0.0)),
-            "total_latency_ms": float(self._inference_timing_acc.get("prefill_latency_ms", 0.0) + self._inference_timing_acc.get("decode_latency_ms", 0.0)),
-            "prefill_decode_split": "approximate_by_generate_calls",
-            "pruning_info": getattr(self, "pruning_info", None),
-        }
         
         return causal_output
 

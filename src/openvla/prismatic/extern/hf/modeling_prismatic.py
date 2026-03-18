@@ -564,11 +564,6 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             input_ids = torch.cat(
                 (input_ids, torch.unsqueeze(torch.Tensor([29871]).long(), dim=0).to(input_ids.device)), dim=1
             )
-        total_t0 = None
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-        total_t0 = time.perf_counter()
-
         temporal_history_ready = False
         temporal_history_len = len(self.av_hist)
 
@@ -600,6 +595,8 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
                     'use_text_vision_selection': self.use_text_vision_selection,
                     'use_prefil_attention': self.use_prefil_attention,
                     'SparseVLM': self.sparsevlm,
+                    'temporal_w': self.av_hist.maxlen,
+                    'temporal_gamma': self.av_decay,
                 }
             else:
                 self.fastv_config = {
@@ -612,7 +609,12 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
                     'use_text_vision_selection': self.use_text_vision_selection,
                     'use_prefil_attention': self.use_prefil_attention,
                     'SparseVLM': self.sparsevlm,
+                    'temporal_w': self.av_hist.maxlen,
+                    'temporal_gamma': self.av_decay,
                 }
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            core_t0 = time.perf_counter()
             results = self._generate_with_fastv_forward(
                 input_ids,
                 max_new_tokens=self.get_action_dim(unnorm_key),
@@ -620,7 +622,13 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
                 **kwargs,
             )
         else:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            core_t0 = time.perf_counter()
             results = self.generate(input_ids, max_new_tokens=self.get_action_dim(unnorm_key), **kwargs)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        core_inference_latency_ms = (time.perf_counter() - core_t0) * 1000.0
         attentions = results.attentions
         action_vision_attentions, text_vision_attentions, prefill_attentions = self._extract_action_modality_attentions(attentions, pruning_info=getattr(self.language_model, 'pruning_info', None))
         if action_vision_attentions is not None and action_vision_attentions.numel() > 0:
@@ -646,23 +654,34 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             0.5 * (normalized_actions + 1) * (action_high - action_low) + action_low,
             normalized_actions,
         )
-
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-        total_latency_ms = (time.perf_counter() - total_t0) * 1000.0
-
-        lm_stats = getattr(self.language_model, "last_inference_stats", {}) or {}
         pruning_info = getattr(self.language_model, "pruning_info", None)
+        summary = None
+        dynamic = None
+        if isinstance(pruning_info, dict):
+            summary = {
+                "use_temporal": bool(self.use_temporal),
+                "selection_mode": pruning_info.get("selection_mode"),
+                "pruning_layer": pruning_info.get("pruning_layer"),
+                "original_seq_length": pruning_info.get("original_seq_length"),
+                "original_image_token_length": pruning_info.get("original_image_token_length"),
+                "target_keep_ratio": pruning_info.get("target_keep_ratio"),
+                "num_keep": pruning_info.get("num_keep"),
+                "redundancy_filter_enabled": pruning_info.get("redundancy_filter_enabled"),
+                "temporal_w": pruning_info.get("temporal_w"),
+                "temporal_gamma": pruning_info.get("temporal_gamma"),
+            }
+            dynamic = {
+                "temporal_history_ready": bool(temporal_history_ready),
+                "temporal_history_len": int(temporal_history_len),
+                "kept_seq_length": pruning_info.get("kept_seq_length"),
+                "kept_image_token_length": pruning_info.get("kept_image_token_length"),
+            }
         self.last_inference_stats = {
-            "prefill_latency_ms": float(lm_stats.get("prefill_latency_ms", 0.0)),
-            "decode_latency_ms": float(lm_stats.get("decode_latency_ms", 0.0)),
-            "total_latency_ms": float(total_latency_ms),
-            "prefill_decode_split": lm_stats.get("prefill_decode_split", "approximate_by_generate_calls"),
-            "use_temporal": bool(self.use_temporal),
-            "temporal_history_ready": bool(temporal_history_ready),
-            "temporal_history_len": int(temporal_history_len),
-            "selection_mode": pruning_info.get("selection_mode") if isinstance(pruning_info, dict) else None,
-            "redundancy_filter_applied": pruning_info.get("redundancy_filter_applied") if isinstance(pruning_info, dict) else None,
+            "core_inference_latency_ms": float(core_inference_latency_ms),
+            "core_prefill_latency_ms": None,
+            "core_decode_latency_ms": None,
+            "summary": summary,
+            "dynamic": dynamic,
             "pruning_info": pruning_info,
         }
 
