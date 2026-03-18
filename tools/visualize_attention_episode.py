@@ -14,6 +14,7 @@ import textwrap
 from pathlib import Path
 from types import SimpleNamespace
 
+import imageio.v2 as imageio
 import numpy as np
 import torch
 from PIL import Image, ImageDraw
@@ -78,6 +79,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--temporal_w", type=int, default=3)
     parser.add_argument("--temporal_gamma", type=float, default=0.8)
     parser.add_argument("--num_steps_wait", type=int, default=10)
+    parser.add_argument("--render_full_episode", action="store_true", default=False)
+    parser.add_argument("--max_steps", type=int, default=None)
+    parser.add_argument("--save_frames", action="store_true", default=False)
+    parser.add_argument("--save_debug_assets", action="store_true", default=False)
+    parser.add_argument("--video_format", choices=["mp4", "gif"], default="mp4")
+    parser.add_argument("--fps", type=int, default=5)
     return parser.parse_args()
 
 
@@ -311,12 +318,11 @@ def make_legend_tile(tile_w: int, tile_h: int) -> Image.Image:
     return card
 
 
-def save_panel(
-    output_path: Path,
+def build_panel(
     title_lines: list[str],
     metadata_lines: list[str],
     tiles: list[tuple[str, Image.Image | None, str | None]],
-) -> None:
+) -> Image.Image:
     tile_w, tile_h = 300, 300
     cols = 4
     rows = 2
@@ -353,7 +359,7 @@ def save_panel(
         width=88,
     )
     draw_centered_multiline(draw, (pad + 12, footer_y0 + 8, panel_w - pad - 12, panel_h - pad - 8), footer_text, fill=(45, 50, 60))
-    panel.save(output_path)
+    return panel
 
 
 def write_json(path: Path, payload: dict) -> None:
@@ -368,7 +374,7 @@ def write_json(path: Path, payload: dict) -> None:
     path.write_text(json.dumps(serializable, indent=2, ensure_ascii=False))
 
 
-def capture_step_artifacts(
+def render_step_artifacts(
     output_dir: Path,
     task_name: str,
     episode_idx: int,
@@ -376,7 +382,8 @@ def capture_step_artifacts(
     mode: str,
     rgb: np.ndarray,
     model,
-) -> None:
+    save_debug_assets: bool,
+) -> tuple[Image.Image, dict]:
     telemetry = getattr(model, "last_inference_stats", {}) or {}
     pruning_info = telemetry.get("pruning_info") or {}
     vis_cache = getattr(model, "last_visualization_cache", {}) or {}
@@ -434,22 +441,7 @@ def capture_step_artifacts(
     unavailable = [name for name, reason in unavailable_reasons.items() if reason is not None]
 
     rgb_image = Image.fromarray(rgb.astype(np.uint8))
-    rgb_image.save(output_dir / f"step_{step:02d}_rgb.png")
-    if pref_overlay is not None:
-        pref_overlay.save(output_dir / f"step_{step:02d}_prefill_overlay.png")
-    if decode_overlay is not None:
-        decode_overlay.save(output_dir / f"step_{step:02d}_decode_overlay.png")
-    if temporal_overlay is not None:
-        temporal_overlay.save(output_dir / f"step_{step:02d}_temporal_guide_overlay.png")
-    if current_score_overlay is not None:
-        current_score_overlay.save(output_dir / f"step_{step:02d}_current_score_overlay.png")
-    if keep_mask_overlay is not None:
-        keep_mask_overlay.save(output_dir / f"step_{step:02d}_keep_mask.png")
-    if prune_mask_overlay is not None:
-        prune_mask_overlay.save(output_dir / f"step_{step:02d}_prune_mask.png")
-
-    save_panel(
-        output_path=output_dir / f"step_{step:02d}_panel.png",
+    panel = build_panel(
         title_lines=[
             task_name,
             f"episode={episode_idx}   step={step}   mode={mode}",
@@ -501,7 +493,46 @@ def capture_step_artifacts(
         "unavailable_visualizations": unavailable,
         "unavailable_reasons": unavailable_reasons,
     }
-    write_json(output_dir / f"step_{step:02d}_meta.json", meta)
+    if save_debug_assets:
+        rgb_image.save(output_dir / f"step_{step:04d}_rgb.png")
+        if pref_overlay is not None:
+            pref_overlay.save(output_dir / f"step_{step:04d}_prefill_overlay.png")
+        if decode_overlay is not None:
+            decode_overlay.save(output_dir / f"step_{step:04d}_decode_overlay.png")
+        if temporal_overlay is not None:
+            temporal_overlay.save(output_dir / f"step_{step:04d}_temporal_guide_overlay.png")
+        if current_score_overlay is not None:
+            current_score_overlay.save(output_dir / f"step_{step:04d}_current_score_overlay.png")
+        if keep_mask_overlay is not None:
+            keep_mask_overlay.save(output_dir / f"step_{step:04d}_keep_mask.png")
+        if prune_mask_overlay is not None:
+            prune_mask_overlay.save(output_dir / f"step_{step:04d}_prune_mask.png")
+        write_json(output_dir / f"step_{step:04d}_meta.json", meta)
+    return panel, meta
+
+
+def create_video_writer(output_path: Path, fps: int, video_format: str):
+    if video_format == "gif":
+        return imageio.get_writer(output_path, mode="I", fps=fps)
+    return imageio.get_writer(output_path, fps=fps)
+
+
+def save_panel_frame(panel: Image.Image, frames_dir: Path, step: int) -> Path:
+    frame_path = frames_dir / f"step_{step:04d}_panel.png"
+    panel.save(frame_path)
+    return frame_path
+
+
+def append_panel_to_video(writer, panel: Image.Image) -> None:
+    writer.append_data(np.asarray(panel.convert("RGB")))
+
+
+def should_capture_step(render_full_episode: bool, step: int, selected_steps: set[int]) -> bool:
+    return render_full_episode or step in selected_steps
+
+
+def get_video_output_path(base_dir: Path, video_format: str) -> Path:
+    return base_dir / f"episode_panel.{video_format}"
 
 
 def main() -> None:
@@ -509,6 +540,7 @@ def main() -> None:
     cfg = build_cfg(args)
     cfg.unnorm_key = cfg.task_suite_name
     steps = sorted(set(args.steps or DEFAULT_STEPS))
+    selected_steps = set(steps)
     set_seed_everywhere(cfg.seed)
 
     model = get_model(cfg)
@@ -530,6 +562,15 @@ def main() -> None:
 
     output_dir = Path(args.output_dir) / cfg.task_suite_name / args.mode / f"task_{task_index:02d}" / f"episode_{args.episode_idx:02d}"
     output_dir.mkdir(parents=True, exist_ok=True)
+    frames_dir = output_dir / "frames"
+    if args.save_frames:
+        frames_dir.mkdir(parents=True, exist_ok=True)
+
+    video_writer = None
+    video_output_path = None
+    if args.render_full_episode:
+        video_output_path = get_video_output_path(output_dir, args.video_format)
+        video_writer = create_video_writer(video_output_path, fps=args.fps, video_format=args.video_format)
 
     env.reset()
     model.reset_av_history()
@@ -538,8 +579,8 @@ def main() -> None:
     done = False
     prev_img = None
     last_caches = None
-    max_steps = get_max_steps(cfg.task_suite_name)
-    max_target_step = max(steps)
+    max_steps = args.max_steps if args.max_steps is not None else get_max_steps(cfg.task_suite_name)
+    max_target_step = max_steps if args.render_full_episode else max(steps)
 
     while t < max_steps + cfg.num_steps_wait and t <= max_target_step and not done:
         if t < cfg.num_steps_wait:
@@ -565,8 +606,8 @@ def main() -> None:
             last_caches=last_caches,
         )
 
-        if t in steps:
-            capture_step_artifacts(
+        if should_capture_step(args.render_full_episode, t, selected_steps):
+            panel, meta = render_step_artifacts(
                 output_dir=output_dir,
                 task_name=task_description,
                 episode_idx=args.episode_idx,
@@ -574,7 +615,12 @@ def main() -> None:
                 mode=args.mode,
                 rgb=img,
                 model=model,
+                save_debug_assets=args.save_debug_assets,
             )
+            if args.save_frames or not args.render_full_episode:
+                save_panel_frame(panel, frames_dir if args.save_frames else output_dir, t)
+            if video_writer is not None:
+                append_panel_to_video(video_writer, panel)
 
         action = normalize_gripper_action(action, binarize=True)
         action = invert_gripper_action(action)
@@ -585,6 +631,9 @@ def main() -> None:
         t += 1
 
     env.close()
+    if video_writer is not None:
+        video_writer.close()
+        print(f"Saved episode panel video to {video_output_path}")
     print(f"Saved visualization artifacts to {output_dir}")
 
 
