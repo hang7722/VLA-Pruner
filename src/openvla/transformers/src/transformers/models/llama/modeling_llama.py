@@ -995,6 +995,7 @@ class LlamaModel(LlamaPreTrainedModel):
         SparseVLM = fastv_config['SparseVLM']
         temporal_w = fastv_config.get('temporal_w')
         temporal_gamma = fastv_config.get('temporal_gamma')
+        current_selection_score = None
         
         if SparseVLM:
             use_text_vision_selection = True
@@ -1069,6 +1070,7 @@ class LlamaModel(LlamaPreTrainedModel):
         pruning_info['pruning_triggered'] = False
         pruning_info['selection_mode'] = 'fastv_last_token'
         pruning_info['redundancy_filter_enabled'] = bool(use_temporal)
+        pruning_info['image_token_start_index'] = FASTV_image_token_start_index
         pruning_info['original_image_token_length'] = FASTV_image_token_length
         pruning_info['kept_image_token_length'] = FASTV_image_token_length
         pruning_info['num_keep'] = FASTV_image_token_length
@@ -1112,6 +1114,7 @@ class LlamaModel(LlamaPreTrainedModel):
                             pruning_info['selection_mode'] = 'fastv_last_token'
 
                         last_layer_attention_avg_last_tok_image = last_layer_attention_avg_last_tok[FASTV_image_token_start_index:FASTV_image_token_start_index+FASTV_image_token_length]
+                        current_selection_score = last_layer_attention_avg_last_tok_image.detach().float().cpu()
                         num_keep = round(FASTV_image_token_length * (1 - FASTV_r))
 
                         if use_temporal and Temporal_Guide is not None:
@@ -1182,6 +1185,7 @@ class LlamaModel(LlamaPreTrainedModel):
                     last_layer_attention_avg_last_tok = last_layer_attention_avg[-1]
                     # get the attention in image token
                     last_layer_attention_avg_last_tok_image = last_layer_attention_avg_last_tok[FASTV_image_token_start_index:FASTV_image_token_start_index+FASTV_image_token_length]
+                    current_selection_score = last_layer_attention_avg_last_tok_image.detach().float().cpu()
                     # get the indexs of the top ATTENTION_RANK tokens
                     num_keep = round(FASTV_image_token_length * (1 - FASTV_r))
                     # compute top_attention_rank_index (was missing in this branch!)
@@ -1250,6 +1254,11 @@ class LlamaModel(LlamaPreTrainedModel):
             )
         
         self.last_pruning_stats = pruning_info
+        if getattr(self, "enable_visualization_cache", False):
+            self.last_visualization_cache = {
+                "current_selection_score": current_selection_score,
+                "temporal_guide": Temporal_Guide.detach().float().cpu() if Temporal_Guide is not None else None,
+            }
 
         if not return_dict:
             self.pruning_info = pruning_info
@@ -1573,6 +1582,8 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         # Sync pruning info from decoder for upper layer access
         if hasattr(self.model, 'pruning_info'):
             self.pruning_info = self.model.pruning_info
+        if hasattr(self.model, 'last_visualization_cache'):
+            self.last_visualization_cache = self.model.last_visualization_cache
         
         return causal_output
 

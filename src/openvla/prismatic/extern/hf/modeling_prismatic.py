@@ -551,6 +551,8 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         self.av_decay = getattr(config, 'av_decay', 0.8)
         self.use_temporal = getattr(config, 'use_temporal', False)
         self.sparsevlm = getattr(config, 'sparsevlm', False)
+        self.enable_visualization_cache = False
+        self.last_visualization_cache = None
     
     def reset_av_history(self):
         self.av_hist.clear()
@@ -684,6 +686,17 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             "dynamic": dynamic,
             "pruning_info": pruning_info,
         }
+        if self.enable_visualization_cache:
+            lm_visualization_cache = getattr(self.language_model, "last_visualization_cache", {}) or {}
+            self.last_visualization_cache = {
+                "action_vision_attentions": action_vision_attentions.detach().cpu() if action_vision_attentions is not None else None,
+                "text_vision_attentions": text_vision_attentions.detach().cpu() if text_vision_attentions is not None else None,
+                "prefill_attentions": prefill_attentions.detach().cpu() if prefill_attentions is not None else None,
+                "current_selection_score": lm_visualization_cache.get("current_selection_score"),
+                "temporal_guide": lm_visualization_cache.get("temporal_guide"),
+                "pruning_info": pruning_info,
+                "core_inference_latency_ms": float(core_inference_latency_ms),
+            }
 
         return actions, last_caches
 
