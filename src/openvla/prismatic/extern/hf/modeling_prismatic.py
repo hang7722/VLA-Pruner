@@ -13,6 +13,7 @@ References [LLaVa, IDEFICS-2]:
 """
 
 import logging
+import time
 from dataclasses import dataclass
 from functools import partial
 from typing import Any, Callable, ClassVar, Dict, List, Optional, Tuple, Union
@@ -550,6 +551,8 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         self.av_decay = getattr(config, 'av_decay', 0.8)
         self.use_temporal = getattr(config, 'use_temporal', False)
         self.sparsevlm = getattr(config, 'sparsevlm', False)
+        self.enable_visualization_cache = False
+        self.last_visualization_cache = None
     
     def reset_av_history(self):
         self.av_hist.clear()
@@ -563,6 +566,9 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             input_ids = torch.cat(
                 (input_ids, torch.unsqueeze(torch.Tensor([29871]).long(), dim=0).to(input_ids.device)), dim=1
             )
+        temporal_history_ready = False
+        temporal_history_len = len(self.av_hist)
+
         if self.use_fastv or self.sparsevlm:
             historical_attention = None
             if self.use_temporal and len(self.av_hist) == self.av_hist.maxlen:
@@ -576,6 +582,9 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
                     guided += weights[i] * self.av_hist[-1 - i]
                 guided = guided / np.sum(guided)
                 historical_attention = torch.tensor(guided, device=input_ids.device, dtype=torch.bfloat16)
+                temporal_history_ready = True
+            else:
+                temporal_history_ready = False
             
             if historical_attention is not None or not self.use_temporal:
                 self.fastv_config = {
@@ -588,6 +597,8 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
                     'use_text_vision_selection': self.use_text_vision_selection,
                     'use_prefil_attention': self.use_prefil_attention,
                     'SparseVLM': self.sparsevlm,
+                    'temporal_w': self.av_hist.maxlen,
+                    'temporal_gamma': self.av_decay,
                 }
             else:
                 self.fastv_config = {
@@ -600,7 +611,12 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
                     'use_text_vision_selection': self.use_text_vision_selection,
                     'use_prefil_attention': self.use_prefil_attention,
                     'SparseVLM': self.sparsevlm,
+                    'temporal_w': self.av_hist.maxlen,
+                    'temporal_gamma': self.av_decay,
                 }
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            core_t0 = time.perf_counter()
             results = self._generate_with_fastv_forward(
                 input_ids,
                 max_new_tokens=self.get_action_dim(unnorm_key),
@@ -608,7 +624,13 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
                 **kwargs,
             )
         else:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            core_t0 = time.perf_counter()
             results = self.generate(input_ids, max_new_tokens=self.get_action_dim(unnorm_key), **kwargs)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        core_inference_latency_ms = (time.perf_counter() - core_t0) * 1000.0
         attentions = results.attentions
         action_vision_attentions, text_vision_attentions, prefill_attentions = self._extract_action_modality_attentions(attentions, pruning_info=getattr(self.language_model, 'pruning_info', None))
         if action_vision_attentions is not None and action_vision_attentions.numel() > 0:
@@ -634,6 +656,48 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             0.5 * (normalized_actions + 1) * (action_high - action_low) + action_low,
             normalized_actions,
         )
+        pruning_info = getattr(self.language_model, "pruning_info", None)
+        summary = None
+        dynamic = None
+        if isinstance(pruning_info, dict):
+            summary = {
+                "use_temporal": bool(self.use_temporal),
+                "selection_mode": pruning_info.get("selection_mode"),
+                "pruning_layer": pruning_info.get("pruning_layer"),
+                "original_seq_length": pruning_info.get("original_seq_length"),
+                "original_image_token_length": pruning_info.get("original_image_token_length"),
+                "target_keep_ratio": pruning_info.get("target_keep_ratio"),
+                "num_keep": pruning_info.get("num_keep"),
+                "redundancy_filter_enabled": pruning_info.get("redundancy_filter_enabled"),
+                "temporal_w": pruning_info.get("temporal_w"),
+                "temporal_gamma": pruning_info.get("temporal_gamma"),
+            }
+            dynamic = {
+                "temporal_history_ready": bool(temporal_history_ready),
+                "temporal_history_len": int(temporal_history_len),
+                "kept_seq_length": pruning_info.get("kept_seq_length"),
+                "kept_image_token_length": pruning_info.get("kept_image_token_length"),
+            }
+        self.last_inference_stats = {
+            "core_inference_latency_ms": float(core_inference_latency_ms),
+            "core_prefill_latency_ms": None,
+            "core_decode_latency_ms": None,
+            "summary": summary,
+            "dynamic": dynamic,
+            "pruning_info": pruning_info,
+        }
+        if self.enable_visualization_cache:
+            lm_visualization_cache = getattr(self.language_model, "last_visualization_cache", {}) or {}
+            self.last_visualization_cache = {
+                "action_vision_attentions": action_vision_attentions.detach().cpu() if action_vision_attentions is not None else None,
+                "text_vision_attentions": text_vision_attentions.detach().cpu() if text_vision_attentions is not None else None,
+                "prefill_attentions": prefill_attentions.detach().cpu() if prefill_attentions is not None else None,
+                "current_selection_score": lm_visualization_cache.get("current_selection_score"),
+                "temporal_guide": lm_visualization_cache.get("temporal_guide"),
+                "pruning_info": pruning_info,
+                "core_inference_latency_ms": float(core_inference_latency_ms),
+            }
+
         return actions, last_caches
 
 
@@ -721,4 +785,3 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         """Get all the logged statistics for the given dataset."""
         unnorm_key = self._check_unnorm_key(self.norm_stats, unnorm_key)
         return self.norm_stats[unnorm_key]["action"]
-

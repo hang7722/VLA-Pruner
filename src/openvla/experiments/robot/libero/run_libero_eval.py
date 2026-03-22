@@ -169,6 +169,9 @@ def eval_libero(cfg: GenerateConfig) -> None:
             replay_images_heatmap = []
             prev_img = None
             last_caches = None
+            episode_telemetry_summary_logged = False
+            last_dynamic_telemetry = {}
+            pending_episode_summary = None
             if cfg.task_suite_name == "libero_spatial":
                 max_steps = 220  # longest training demo has 193 steps
             elif cfg.task_suite_name == "libero_object":
@@ -215,6 +218,54 @@ def eval_libero(cfg: GenerateConfig) -> None:
                         processor=processor,
                         last_caches=last_caches,
                     )
+                    telemetry = getattr(model, "last_inference_stats", None)
+                    if isinstance(telemetry, dict):
+                        summary = telemetry.get("summary") or {}
+                        dynamic = telemetry.get("dynamic") or {}
+                        if summary:
+                            pending_episode_summary = summary
+                        summary_ready = (
+                            not summary.get("use_temporal", False)
+                            or dynamic.get("temporal_history_ready", False)
+                            or summary.get("target_keep_ratio") not in (None, 1.0)
+                        )
+                        if summary and summary_ready and not episode_telemetry_summary_logged:
+                            summary_line = (
+                                f"[Telemetry][episode={task_episodes+1}] "
+                                f"use_temporal={summary.get('use_temporal')} "
+                                f"selection_mode={summary.get('selection_mode')} "
+                                f"pruning_layer={summary.get('pruning_layer')} "
+                                f"original_seq_length={summary.get('original_seq_length')} "
+                                f"original_image_token_length={summary.get('original_image_token_length')} "
+                                f"target_keep_ratio={summary.get('target_keep_ratio')} "
+                                f"num_keep={summary.get('num_keep')} "
+                                f"redundancy_filter_enabled={summary.get('redundancy_filter_enabled')} "
+                                f"temporal_w={summary.get('temporal_w')} "
+                                f"temporal_gamma={summary.get('temporal_gamma')}"
+                            )
+                            print(summary_line)
+                            log_file.write(summary_line + "\n")
+                            episode_telemetry_summary_logged = True
+
+                        changed_dynamic = {}
+                        for key in ("temporal_history_ready", "temporal_history_len", "kept_seq_length", "kept_image_token_length"):
+                            if key in dynamic and last_dynamic_telemetry.get(key) != dynamic.get(key):
+                                changed_dynamic[key] = dynamic.get(key)
+                        last_dynamic_telemetry.update(dynamic)
+
+                        step_line_parts = [
+                            f"[Telemetry][step={t}]",
+                            f"core_inference_latency_ms={telemetry.get('core_inference_latency_ms'):.3f}",
+                        ]
+                        if telemetry.get("core_prefill_latency_ms") is not None:
+                            step_line_parts.append(f"core_prefill_latency_ms={telemetry.get('core_prefill_latency_ms'):.3f}")
+                        if telemetry.get("core_decode_latency_ms") is not None:
+                            step_line_parts.append(f"core_decode_latency_ms={telemetry.get('core_decode_latency_ms'):.3f}")
+                        for key, value in changed_dynamic.items():
+                            step_line_parts.append(f"{key}={value}")
+                        step_line = " ".join(step_line_parts)
+                        print(step_line)
+                        log_file.write(step_line + "\n")
                     replay_images_heatmap.append(result_image)
                     # Normalize gripper action [0,1] -> [-1,+1] because the environment expects the latter
                     action = normalize_gripper_action(action, binarize=True)
@@ -229,6 +280,22 @@ def eval_libero(cfg: GenerateConfig) -> None:
                         total_successes += 1
                         break
                     t += 1
+            if pending_episode_summary is not None and not episode_telemetry_summary_logged:
+                summary_line = (
+                    f"[Telemetry][episode={task_episodes+1}] "
+                    f"use_temporal={pending_episode_summary.get('use_temporal')} "
+                    f"selection_mode={pending_episode_summary.get('selection_mode')} "
+                    f"pruning_layer={pending_episode_summary.get('pruning_layer')} "
+                    f"original_seq_length={pending_episode_summary.get('original_seq_length')} "
+                    f"original_image_token_length={pending_episode_summary.get('original_image_token_length')} "
+                    f"target_keep_ratio={pending_episode_summary.get('target_keep_ratio')} "
+                    f"num_keep={pending_episode_summary.get('num_keep')} "
+                    f"redundancy_filter_enabled={pending_episode_summary.get('redundancy_filter_enabled')} "
+                    f"temporal_w={pending_episode_summary.get('temporal_w')} "
+                    f"temporal_gamma={pending_episode_summary.get('temporal_gamma')}"
+                )
+                print(summary_line)
+                log_file.write(summary_line + "\n")
             task_episodes += 1
             total_episodes += 1
 
